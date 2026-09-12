@@ -16,6 +16,38 @@ use anyhow::{anyhow, Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 
+/// UTC in the shape the transcript uses, so `at=` means one thing throughout.
+/// Civil date from a day count, after Howard Hinnant's algorithm.
+pub fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// The outbox log `claude-send` appends to, beside the buffer it sent.
+pub fn sent_log(outbox_dir: &Path) -> PathBuf {
+    outbox_dir.join("sent.jsonl")
+}
+
 /// The files one Claude Code session writes.
 pub struct Session {
     pub id: String,
@@ -272,6 +304,12 @@ pub enum Unit {
         kind: MetaKind,
         fields: Vec<(String, String)>,
     },
+    /// Text handed to the agent, recorded when it left rather than when the
+    /// agent got round to it. A queued prompt reaches the transcript only once
+    /// the turn that reads it begins, which can be minutes later.
+    Sent {
+        text: String,
+    },
 }
 
 pub struct Event {
@@ -407,6 +445,26 @@ pub fn read_sidecar(session: &Session, hint: Option<&str>, inline: &str) -> Stri
     fs::read_to_string(path).unwrap_or_else(|_| inline.to_string())
 }
 
+/// One line of the outbox log. Yields nothing for a line that is not one.
+pub fn parse_sent(line: &str) -> Result<Option<Event>> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Ok(None);
+    };
+    let Some(text) = v["text"].as_str() else {
+        return Ok(None);
+    };
+    Ok(Some(Event {
+        anchor: Anchor {
+            at: v["at"].as_str().unwrap_or_default().to_string(),
+            uuid: String::new(),
+            thread: Thread::Main,
+        },
+        unit: Unit::Sent {
+            text: text.to_string(),
+        },
+    }))
+}
+
 pub struct RenderOpts {
     pub max_result_lines: usize,
 }
@@ -470,6 +528,7 @@ pub fn render(event: &Event, opts: &RenderOpts) -> String {
         Unit::ToolCall { .. } => "tool",
         Unit::ToolResult { .. } => "result",
         Unit::Meta { .. } => "meta",
+        Unit::Sent { .. } => "sent",
     };
     let head = format!(
         "<!-- claude at={} uuid={} thread={} kind={} -->\n",
@@ -500,6 +559,7 @@ pub fn render(event: &Event, opts: &RenderOpts) -> String {
             ),
             &truncate(body, opts.max_result_lines),
         ),
+        Unit::Sent { text } => fenced("claude:sent", text),
         Unit::Meta { kind, fields } => {
             let body: String = fields
                 .iter()
@@ -513,16 +573,26 @@ pub fn render(event: &Event, opts: &RenderOpts) -> String {
 }
 
 /// One file being tailed, and where reading stopped.
-struct Tailed {
+pub struct Tailed {
     thread: Thread,
     path: PathBuf,
     offset: u64,
 }
 
 impl Tailed {
+    /// Starts at the end, so an existing outbox log is not replayed.
+    pub fn following(path: PathBuf) -> Self {
+        let offset = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Tailed {
+            thread: Thread::Main,
+            path,
+            offset,
+        }
+    }
+
     /// Complete lines appended since the last call. A partial trailing line is
     /// left for the next one.
-    fn drain(&mut self) -> Result<Vec<String>> {
+    pub fn drain(&mut self) -> Result<Vec<String>> {
         let mut file = match fs::File::open(&self.path) {
             Ok(f) => f,
             Err(_) => return Ok(vec![]),

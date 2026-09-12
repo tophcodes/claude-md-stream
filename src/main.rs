@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use claude_md_stream::{
-    frontmatter, parse_line, read_sidecar, poll, render, resolve, Follower, MetaKind,
-    RenderOpts, Session, Target, Thread, Unit,
+    frontmatter, parse_line, parse_sent, poll, read_sidecar, render, resolve, sent_log, Follower,
+    MetaKind, RenderOpts, Session, Tailed, Target, Thread, Unit,
 };
 
 const USAGE: &str = "usage: claude-md-stream tail <agent|session-id> \
@@ -114,13 +114,35 @@ fn now_iso() -> String {
 fn meta(session: &Session, kind: MetaKind, fields: Vec<(String, String)>, opts: &RenderOpts) {
     let event = claude_md_stream::Event {
         anchor: claude_md_stream::Anchor {
-            at: now_iso(),
+            at: claude_md_stream::now_iso(),
             uuid: session.id.clone(),
             thread: Thread::Main,
         },
         unit: Unit::Meta { kind, fields },
     };
     print!("{}", render(&event, opts));
+}
+
+/// Where `claude-send` writes what it handed to an agent. Convention rather
+/// than a flag: the sender derives the same path from the same handle.
+fn outbox(handle: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(sent_log(
+        &std::path::PathBuf::from(home)
+            .join(".local/state/claude-md-stream")
+            .join(handle),
+    ))
+}
+
+/// Prints what has been sent since the last look.
+fn drain_sent(tail: &mut Option<Tailed>, opts: &RenderOpts) -> Result<()> {
+    let Some(tail) = tail else { return Ok(()) };
+    for line in tail.drain()? {
+        if let Some(event) = parse_sent(&line)? {
+            print!("{}", render(&event, opts));
+        }
+    }
+    Ok(())
 }
 
 /// How often the agent list is asked what the pane is doing. The stream itself
@@ -178,9 +200,13 @@ fn main() -> Result<()> {
         let mut state: Option<String> = None;
         let mut since = std::time::Instant::now();
         let mut polled_at = std::time::Instant::now();
+        // Starts at the end of the log: what was sent before this viewer
+        // existed has long since reached the transcript.
+        let mut sent = outbox(&args.target).map(Tailed::following);
         let switched = loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok((thread, line)) => {
+                    drain_sent(&mut sent, &opts)?;
                     if polled_at.elapsed() >= POLL_EVERY {
                         let p = poll(&target, &session)?;
                         report(&session, &p, &mut state, &mut since, &opts);
@@ -204,6 +230,7 @@ fn main() -> Result<()> {
                     emit(&session, &thread, &line, &opts)?
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    drain_sent(&mut sent, &opts)?;
                     let p = poll(&target, &session)?;
                     report(&session, &p, &mut state, &mut since, &opts);
                     polled_at = std::time::Instant::now();

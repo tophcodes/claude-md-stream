@@ -33,6 +33,27 @@ fn buffer_path(args: &[String]) -> Result<PathBuf> {
         .map_err(|_| anyhow!("{USAGE}"))
 }
 
+/// Appends the sent text to the outbox log. A viewer tails that log to show
+/// the prompt when it left, rather than when the agent finally reads it.
+/// Failing to record is not worth failing the send over.
+fn record(buffer: &Path, text: &str) {
+    let dir = buffer
+        .canonicalize()
+        .unwrap_or_else(|_| buffer.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf);
+    let Some(dir) = dir else { return };
+    let entry = serde_json::json!({ "at": claude_md_stream::now_iso(), "text": text });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(claude_md_stream::sent_log(&dir))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{entry}");
+    }
+}
+
 fn run() -> Result<u8> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = buffer_path(&args)?;
@@ -57,6 +78,7 @@ fn run() -> Result<u8> {
         .context("running `herdr agent prompt`")?;
 
     if out.status.success() {
+        record(&path, &text);
         println!("sent {} bytes to {handle}", text.len());
         return Ok(0);
     }
