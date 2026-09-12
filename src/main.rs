@@ -123,6 +123,34 @@ fn meta(session: &Session, kind: MetaKind, fields: Vec<(String, String)>, opts: 
     print!("{}", render(&event, opts));
 }
 
+/// How often the agent list is asked what the pane is doing. The stream itself
+/// carries no such signal, so this is wall clock rather than line-driven.
+const POLL_EVERY: Duration = Duration::from_secs(2);
+
+/// Emits a status unit when the observed state changed. `observed` is how long
+/// herdr reported the previous state, which is not the agent's own accounting
+/// of how long it worked.
+fn report(
+    session: &Session,
+    polled: &claude_md_stream::Poll,
+    state: &mut Option<String>,
+    since: &mut std::time::Instant,
+    opts: &RenderOpts,
+) {
+    if polled.state == *state {
+        return;
+    }
+    if let Some(now) = &polled.state {
+        let mut fields = vec![("state".into(), now.clone())];
+        if state.is_some() {
+            fields.push(("observed".into(), format!("{}s", since.elapsed().as_secs())));
+        }
+        meta(session, MetaKind::Status, fields, opts);
+    }
+    *state = polled.state.clone();
+    *since = std::time::Instant::now();
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     let target = Target::parse(&args.target);
@@ -149,9 +177,18 @@ fn main() -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut state: Option<String> = None;
         let mut since = std::time::Instant::now();
+        let mut polled_at = std::time::Instant::now();
         let switched = loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok((thread, line)) => {
+                    if polled_at.elapsed() >= POLL_EVERY {
+                        let p = poll(&target, &session)?;
+                        report(&session, &p, &mut state, &mut since, &opts);
+                        polled_at = std::time::Instant::now();
+                        if let Some(next) = p.switched {
+                            break Some(next);
+                        }
+                    }
                     // A subagent announces itself by its first line: nothing in
                     // the main thread mentions it until it has finished.
                     if let Thread::Sidechain(id) = &thread {
@@ -167,24 +204,10 @@ fn main() -> Result<()> {
                     emit(&session, &thread, &line, &opts)?
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    let polled = poll(&target, &session)?;
-                    if polled.state != state {
-                        // Only the change is worth a line. A pane that sits at
-                        // `working` for two minutes should stay quiet.
-                        if let Some(now) = &polled.state {
-                            let mut fields = vec![("state".into(), now.clone())];
-                            if state.is_some() {
-                                fields.push((
-                                    "after".into(),
-                                    format!("{}s", since.elapsed().as_secs()),
-                                ));
-                            }
-                            meta(&session, MetaKind::Status, fields, &opts);
-                        }
-                        state = polled.state;
-                        since = std::time::Instant::now();
-                    }
-                    if let Some(next) = polled.switched {
+                    let p = poll(&target, &session)?;
+                    report(&session, &p, &mut state, &mut since, &opts);
+                    polled_at = std::time::Instant::now();
+                    if let Some(next) = p.switched {
                         break Some(next);
                     }
                 }
