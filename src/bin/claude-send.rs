@@ -8,7 +8,10 @@ use anyhow::{anyhow, Context, Result};
 const USAGE: &str = "usage: claude-send <path-to-buffer>";
 
 /// `~/.local/state/claude-md-stream/<handle>/input.md` names its own target.
+/// The path is resolved first: an editor passes the buffer name relative to its
+/// own working directory, which on its own has no parent to read a handle from.
 fn handle_of(path: &Path) -> Result<String> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     path.parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
