@@ -1,11 +1,16 @@
 //! Sends an outbox buffer to the herdr agent named by its directory.
+//!
+//! The text comes from the file, or from stdin with `--stdin`. An editor whose
+//! save is asynchronous races a reader of the file, so piping the buffer in is
+//! the reliable path; the argument is then only there to name the agent.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
 
-const USAGE: &str = "usage: claude-send <path-to-buffer>";
+const USAGE: &str = "usage: claude-send [--stdin] <path-to-buffer>";
 
 /// `~/.local/state/claude-md-stream/<handle>/input.md` names its own target.
 /// The path is resolved first: an editor passes the buffer name relative to its
@@ -19,8 +24,8 @@ fn handle_of(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("cannot tell which agent {path:?} belongs to"))
 }
 
-fn buffer_path() -> Result<PathBuf> {
-    if let Some(arg) = std::env::args().nth(1) {
+fn buffer_path(args: &[String]) -> Result<PathBuf> {
+    if let Some(arg) = args.iter().find(|a| *a != "--stdin") {
         return Ok(PathBuf::from(arg));
     }
     std::env::var("CLAUDE_SEND_TARGET")
@@ -29,9 +34,17 @@ fn buffer_path() -> Result<PathBuf> {
 }
 
 fn run() -> Result<u8> {
-    let path = buffer_path()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = buffer_path(&args)?;
     let handle = handle_of(&path)?;
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?;
+
+    let text = if args.iter().any(|a| a == "--stdin") {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?
+    };
 
     if text.trim().is_empty() {
         eprintln!("nothing to send");
