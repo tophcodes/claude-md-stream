@@ -141,22 +141,37 @@ fn first_cwd(transcript: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Re-reads the agent list to see whether the pane now holds a different
-/// session. `None` while the session is unchanged.
-pub fn resolve_switch(target: &Target, current: &Session) -> Result<Option<Session>> {
+/// What one look at the agent list says about a followed pane. Both answers
+/// come from the same call so following costs one subprocess, not two.
+pub struct Poll {
+    /// Set when the pane now holds a different session.
+    pub switched: Option<Session>,
+    /// `working`, `idle`, `blocked`, as herdr reports it. `None` for a session
+    /// followed by id, which has no pane to ask about.
+    pub state: Option<String>,
+}
+
+/// Re-reads the agent list to see whether the pane moved on, and what the agent
+/// is doing. The state is the only thing in this tool that does not come from
+/// the transcript, and it never enters a unit's content.
+pub fn poll(target: &Target, current: &Session) -> Result<Poll> {
+    let mut out = Poll {
+        switched: None,
+        state: None,
+    };
     let Target::Agent(name) = target else {
-        return Ok(None);
+        return Ok(out);
     };
     let Some(agent) = herdr_agents()?.into_iter().find(|a| agent_matches(a, name)) else {
-        return Ok(None);
+        return Ok(out);
     };
-    let Some((id, cwd)) = session_of(&agent) else {
-        return Ok(None);
-    };
-    if id == current.id {
-        return Ok(None);
+    out.state = agent["agent_status"].as_str().map(str::to_string);
+    if let Some((id, cwd)) = session_of(&agent) {
+        if id != current.id {
+            out.switched = Some(session_from_parts(id, cwd)?);
+        }
     }
-    session_from_parts(id, cwd).map(Some)
+    Ok(out)
 }
 
 /// Which conversation a unit belongs to. Several subagents run at once, so
@@ -208,6 +223,9 @@ pub enum MetaKind {
     SidechainStart,
     SidechainEnd,
     UnknownBlock,
+    /// The agent changed between working and waiting. Out of band: this comes
+    /// from herdr, not from the transcript.
+    Status,
 }
 
 impl MetaKind {
@@ -219,6 +237,7 @@ impl MetaKind {
             MetaKind::SidechainStart => "sidechain-start",
             MetaKind::SidechainEnd => "sidechain-end",
             MetaKind::UnknownBlock => "unknown-block",
+            MetaKind::Status => "status",
         }
     }
 }

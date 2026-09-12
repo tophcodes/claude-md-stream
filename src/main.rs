@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use claude_md_stream::{
-    frontmatter, parse_line, read_sidecar, render, resolve, resolve_switch, Follower, MetaKind,
+    frontmatter, parse_line, read_sidecar, poll, render, resolve, Follower, MetaKind,
     RenderOpts, Session, Target, Thread, Unit,
 };
 
@@ -84,10 +84,37 @@ fn emit(session: &Session, thread: &Thread, line: &str, opts: &RenderOpts) -> Re
     Ok(())
 }
 
+/// UTC in the shape the transcript uses, so `at=` means one thing throughout.
+/// Civil date from a day count, after Howard Hinnant's algorithm.
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 fn meta(session: &Session, kind: MetaKind, fields: Vec<(String, String)>, opts: &RenderOpts) {
     let event = claude_md_stream::Event {
         anchor: claude_md_stream::Anchor {
-            at: String::new(),
+            at: now_iso(),
             uuid: session.id.clone(),
             thread: Thread::Main,
         },
@@ -120,6 +147,8 @@ fn main() -> Result<()> {
         // The reader blocks on its own file; the timeout is what lets a session
         // that moved to another id be noticed at all.
         let mut seen: HashSet<String> = HashSet::new();
+        let mut state: Option<String> = None;
+        let mut since = std::time::Instant::now();
         let switched = loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok((thread, line)) => {
@@ -138,7 +167,24 @@ fn main() -> Result<()> {
                     emit(&session, &thread, &line, &opts)?
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Some(next) = resolve_switch(&target, &session)? {
+                    let polled = poll(&target, &session)?;
+                    if polled.state != state {
+                        // Only the change is worth a line. A pane that sits at
+                        // `working` for two minutes should stay quiet.
+                        if let Some(now) = &polled.state {
+                            let mut fields = vec![("state".into(), now.clone())];
+                            if state.is_some() {
+                                fields.push((
+                                    "after".into(),
+                                    format!("{}s", since.elapsed().as_secs()),
+                                ));
+                            }
+                            meta(&session, MetaKind::Status, fields, &opts);
+                        }
+                        state = polled.state;
+                        since = std::time::Instant::now();
+                    }
+                    if let Some(next) = polled.switched {
                         break Some(next);
                     }
                 }
