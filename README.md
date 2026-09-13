@@ -27,14 +27,15 @@ inputs.claude-md-stream.url = "github:tophcodes/claude-md-stream";
 ## Reading
 
 ```sh
-claude-md-stream tail <agent|session-id> [--no-follow] [--no-sidechains] [--max-result-lines N]
+claude-md-stream tail <agent|session-id> [--no-follow] [--no-sidechains] [--no-anchors] [--max-result-lines N]
 ```
 
 The target is whatever `herdr agent list` knows the pane as: its name, `pane_id`,
 `tab_id` or `workspace_id`. A session UUID works too, for a session with no pane.
 
 Output is Markdown on stdout, appended forever. `--no-follow` renders what exists
-and exits.
+and exits. `--no-anchors` drops the comment before each unit, which a renderer
+hides anyway and a bare terminal shows as every other line.
 
 ## Writing
 

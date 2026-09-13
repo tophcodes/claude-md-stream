@@ -6,6 +6,7 @@ fn rendered() -> String {
     let fixture = include_str!("fixtures/session.jsonl");
     let opts = RenderOpts {
         max_result_lines: 40,
+        anchors: true,
     };
     fixture
         .lines()

@@ -11,12 +11,13 @@ use claude_md_stream::{
 };
 
 const USAGE: &str = "usage: claude-md-stream tail <agent|session-id> \
-[--no-follow] [--no-sidechains] [--max-result-lines N]";
+[--no-follow] [--no-sidechains] [--no-anchors] [--max-result-lines N]";
 
 struct Args {
     target: String,
     follow: bool,
     sidechains: bool,
+    anchors: bool,
     max_result_lines: usize,
 }
 
@@ -29,12 +30,14 @@ fn parse_args() -> Result<Args> {
         target: String::new(),
         follow: true,
         sidechains: true,
+        anchors: true,
         max_result_lines: 40,
     };
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--no-follow" => args.follow = false,
             "--no-sidechains" => args.sidechains = false,
+            "--no-anchors" => args.anchors = false,
             "--max-result-lines" => {
                 args.max_result_lines = argv
                     .next()
@@ -178,6 +181,7 @@ fn main() -> Result<()> {
     let target = Target::parse(&args.target);
     let opts = RenderOpts {
         max_result_lines: args.max_result_lines,
+        anchors: args.anchors,
     };
 
     let mut session = resolve(&target)?;

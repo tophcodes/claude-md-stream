@@ -467,6 +467,10 @@ pub fn parse_sent(line: &str) -> Result<Option<Event>> {
 
 pub struct RenderOpts {
     pub max_result_lines: usize,
+    /// Whether to precede each unit with its anchor comment. A frontend needs
+    /// it; someone reading the raw stream in a pane sees it as every other
+    /// line, because a terminal shows an HTML comment like any other text.
+    pub anchors: bool,
 }
 
 /// The document header. Emitted once per output stream.
@@ -530,13 +534,17 @@ pub fn render(event: &Event, opts: &RenderOpts) -> String {
         Unit::Meta { .. } => "meta",
         Unit::Sent { .. } => "sent",
     };
-    let head = format!(
-        "<!-- claude at={} uuid={} thread={} kind={} -->\n",
-        event.anchor.at,
-        event.anchor.uuid,
-        event.anchor.thread.label(),
-        kind
-    );
+    let head = if opts.anchors {
+        format!(
+            "<!-- claude at={} uuid={} thread={} kind={} -->\n",
+            event.anchor.at,
+            event.anchor.uuid,
+            event.anchor.thread.label(),
+            kind
+        )
+    } else {
+        String::new()
+    };
 
     let body = match &event.unit {
         Unit::Prompt { text } => blockquote(text),

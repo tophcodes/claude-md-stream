@@ -3,6 +3,7 @@ use claude_md_stream::{fence_len, parse_line, render, Anchor, Event, RenderOpts,
 fn opts() -> RenderOpts {
     RenderOpts {
         max_result_lines: 40,
+        anchors: true,
     }
 }
 
@@ -101,4 +102,20 @@ fn the_thread_rides_on_every_anchor() {
         .map(|e| render(e, &opts()))
         .collect();
     assert!(out.contains("thread=agent-7"));
+}
+
+#[test]
+fn anchors_can_be_left_out_for_reading() {
+    let line = r#"{"type":"assistant","uuid":"u","timestamp":"t",
+      "message":{"content":[{"type":"text","text":"hi"}]}}"#;
+    let bare = RenderOpts {
+        max_result_lines: 40,
+        anchors: false,
+    };
+    let out: String = parse_line(line, &Thread::Main)
+        .unwrap()
+        .iter()
+        .map(|e| render(e, &bare))
+        .collect();
+    assert_eq!(out, "hi\n\n");
 }
