@@ -51,6 +51,7 @@ the text here instead is what makes taking it back possible:
 claude-send --to <agent> --cancel   # stop the turn, hand every waiting message back
 claude-send --to <agent> --recall   # take the last one back to edit it
 claude-send --to <agent> --flush    # hand over the next one, if the agent is free
+claude-send --to <agent> --now      # stop the turn and hand over now, without waiting
 ```
 
 `--cancel` and `--recall` print what they recovered on stdout, ahead of anything
@@ -87,6 +88,12 @@ Helix, bound so that a stray `:w` cannot fire a prompt:
 ret = [
   "select_all",
   ":pipe-to claude-send --stdin '%{buffer_name}'",
+  "delete_selection",
+  ":write!",
+]
+"!" = [
+  "select_all",
+  ":pipe-to claude-send --now --stdin '%{buffer_name}'",
   "delete_selection",
   ":write!",
 ]

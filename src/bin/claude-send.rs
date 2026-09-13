@@ -27,6 +27,9 @@ enum Action {
     /// Hand over the next waiting message if the agent is free. For a queue
     /// with no viewer watching it.
     Flush,
+    /// Stop what the agent is doing and hand over what is waiting, rather than
+    /// waiting for it to finish.
+    Now { stdin: bool, path: Option<PathBuf> },
 }
 
 struct Args {
@@ -87,6 +90,11 @@ fn parse_args() -> Result<Args> {
         Action::Recall
     } else if flag("--flush") {
         Action::Flush
+    } else if flag("--now") {
+        Action::Now {
+            stdin: flag("--stdin") || named.is_some(),
+            path,
+        }
     } else {
         Action::Send {
             stdin: flag("--stdin") || named.is_some(),
@@ -108,6 +116,12 @@ fn parse_args() -> Result<Args> {
 ///
 /// The same text is also appended to `recovered.md`, because a caller that
 /// discards stdout would otherwise drop it on the floor.
+fn note(message: &str) {
+    if std::io::stdout().is_terminal() {
+        eprintln!("{message}");
+    }
+}
+
 fn hand_back(outbox: &Path, texts: &[String]) -> Result<()> {
     let mut carried = String::new();
     if !std::io::stdin().is_terminal() {
@@ -162,6 +176,22 @@ fn interrupt(handle: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delivers as soon as the agent frees up, having just been interrupted. The
+/// interrupt takes a moment to land, so a single look at the state would find
+/// the agent still working and hand back nothing.
+fn deliver_now(outbox: &Path, handle: &str) -> Result<Option<String>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(text) = deliver_one(outbox, handle)? {
+            return Ok(Some(text));
+        }
+        if queue::list(outbox).is_empty() || std::time::Instant::now() > deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn run() -> Result<u8> {
     let args = parse_args()?;
 
@@ -169,17 +199,17 @@ fn run() -> Result<u8> {
         Action::Cancel => {
             interrupt(&args.handle)?;
             let waiting = queue::drain(&args.outbox)?;
-            eprintln!(
+            note(&format!(
                 "interrupted {}, {} message(s) handed back",
                 args.handle,
                 waiting.len()
-            );
+            ));
             hand_back(&args.outbox, &waiting)?;
         }
         Action::Recall => {
             let waiting: Vec<String> = queue::pop(&args.outbox)?.into_iter().collect();
             if waiting.is_empty() {
-                eprintln!("nothing waiting to recall");
+                note("nothing waiting to recall");
             }
             hand_back(&args.outbox, &waiting)?;
         }
@@ -187,6 +217,19 @@ fn run() -> Result<u8> {
             Some(sent) => println!("sent {} bytes to {}", sent.len(), args.handle),
             None => eprintln!("nothing delivered: queue empty or {} is busy", args.handle),
         },
+        Action::Now { stdin, path } => {
+            // Anything typed now goes to the back of the queue first, so the
+            // order the messages were written in is the order they arrive in.
+            let text = read_text(stdin, path.as_ref())?;
+            if !text.trim().is_empty() {
+                queue::push(&args.outbox, &text)?;
+            }
+            interrupt(&args.handle)?;
+            match deliver_now(&args.outbox, &args.handle)? {
+                Some(sent) => note(&format!("sent {} bytes to {}", sent.len(), args.handle)),
+                None => note("nothing waiting"),
+            }
+        }
         Action::Send { stdin, path } => {
             let text = read_text(stdin, path.as_ref())?;
             if text.trim().is_empty() {
