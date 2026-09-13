@@ -126,15 +126,15 @@ fn meta(session: &Session, kind: MetaKind, fields: Vec<(String, String)>, opts: 
     print!("{}", render(&event, opts));
 }
 
-/// Where `claude-send` writes what it handed to an agent. Convention rather
-/// than a flag: the sender derives the same path from the same handle.
+/// Where `claude-send` keeps this agent's queue and log. Convention rather than
+/// a flag: the sender derives the same path from the same handle.
 fn outbox(handle: &str) -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(sent_log(
-        &std::path::PathBuf::from(home)
+    Some(
+        std::path::PathBuf::from(home)
             .join(".local/state/claude-md-stream")
             .join(handle),
-    ))
+    )
 }
 
 /// Prints what has been sent since the last look.
@@ -146,6 +146,19 @@ fn drain_sent(tail: &mut Option<Tailed>, opts: &RenderOpts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Hands the agent the next waiting message when it is free to take one. The
+/// viewer does this because it already watches the state; a send from anywhere
+/// else still reaches an idle agent on its own.
+fn flush(outbox: &Option<std::path::PathBuf>, handle: &str, state: &Option<String>) {
+    let Some(outbox) = outbox else { return };
+    if !claude_md_stream::accepts_prompt(state.as_deref()) {
+        return;
+    }
+    if let Err(err) = claude_md_stream::deliver_one(outbox, handle) {
+        eprintln!("claude-md-stream: {err:#}");
+    }
 }
 
 /// How often the agent list is asked what the pane is doing. The stream itself
@@ -206,7 +219,8 @@ fn main() -> Result<()> {
         let mut polled_at = std::time::Instant::now();
         // Starts at the end of the log: what was sent before this viewer
         // existed has long since reached the transcript.
-        let mut sent = outbox(&args.target).map(Tailed::following);
+        let box_dir = outbox(&args.target);
+        let mut sent = box_dir.as_deref().map(sent_log).map(Tailed::following);
         let switched = loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok((thread, line)) => {
@@ -214,6 +228,7 @@ fn main() -> Result<()> {
                     if polled_at.elapsed() >= POLL_EVERY {
                         let p = poll(&target, &session)?;
                         report(&session, &p, &mut state, &mut since, &opts);
+                        flush(&box_dir, &args.target, &p.state);
                         polled_at = std::time::Instant::now();
                         if let Some(next) = p.switched {
                             break Some(next);
@@ -237,6 +252,7 @@ fn main() -> Result<()> {
                     drain_sent(&mut sent, &opts)?;
                     let p = poll(&target, &session)?;
                     report(&session, &p, &mut state, &mut since, &opts);
+                    flush(&box_dir, &args.target, &p.state);
                     polled_at = std::time::Instant::now();
                     if let Some(next) = p.switched {
                         break Some(next);

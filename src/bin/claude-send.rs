@@ -1,72 +1,38 @@
-//! Sends text to a herdr agent, and records what it sent.
+//! Queues text for a herdr agent, and takes it back when asked.
 //!
-//! Sending is one shot: the text goes to `herdr agent prompt`, which types it
-//! into the agent's terminal. Nothing watches the buffer file, which is only
-//! where an editor happens to keep the text until it is sent.
+//! The queue is local. Claude Code has one of its own, but an interrupt flushes
+//! that one rather than discarding it, so text handed over is text that will be
+//! delivered. Holding it here instead is what makes cancelling possible at all.
+//!
+//! Delivery happens whenever someone looks: this command flushes what it can
+//! after queueing, and a running `claude-md-stream tail` flushes on its poll.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
+use claude_md_stream::{deliver_one, queue};
 
-const USAGE: &str = "usage: claude-send --to <agent> | [--stdin] <path-to-buffer>";
+const USAGE: &str =
+    "usage: claude-send [--to <agent> | [--stdin] <path>] [--cancel] [--recall] [--flush]";
 
-/// Where the text comes from and which agent it is for.
-enum Source {
-    /// The agent is named outright, the text arrives on stdin. For a caller
-    /// with no file at all: a text field, a script, another program.
-    Named(String),
-    /// `~/.local/state/claude-md-stream/<agent>/input.md` names its own target.
-    /// The text is read from that file, or from stdin when the caller pipes it
-    /// because its save has not landed yet.
-    Buffer { path: PathBuf, stdin: bool },
+enum Action {
+    /// Read text and put it at the back of the queue.
+    Send { stdin: bool, path: Option<PathBuf> },
+    /// Interrupt the running turn and put everything waiting back in the buffer.
+    Cancel,
+    /// Take the newest waiting message back into the buffer, to edit it.
+    Recall,
+    /// Hand over the next waiting message if the agent is free. For a queue
+    /// with no viewer watching it.
+    Flush,
 }
 
-fn parse_args() -> Result<Source> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if let Some(i) = args.iter().position(|a| a == "--to") {
-        let handle = args
-            .get(i + 1)
-            .ok_or_else(|| anyhow!("--to takes an agent name"))?;
-        return Ok(Source::Named(handle.clone()));
-    }
-
-    let stdin = args.iter().any(|a| a == "--stdin");
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("CLAUDE_SEND_TARGET").ok().map(PathBuf::from))
-        .ok_or_else(|| anyhow!("{USAGE}"))?;
-    Ok(Source::Buffer { path, stdin })
-}
-
-fn read_stdin() -> Result<String> {
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
-    Ok(text)
-}
-
-/// The agent this text is for, and the directory its log belongs in. A path is
-/// resolved first: an editor passes the buffer name relative to its own working
-/// directory, which on its own has no parent to read a handle from.
-fn target(source: &Source) -> Result<(String, PathBuf)> {
-    match source {
-        Source::Named(handle) => Ok((handle.clone(), state_dir()?.join(handle))),
-        Source::Buffer { path, .. } => {
-            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let dir = path
-                .parent()
-                .ok_or_else(|| anyhow!("cannot tell which agent {path:?} belongs to"))?;
-            let handle = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| anyhow!("cannot tell which agent {path:?} belongs to"))?;
-            Ok((handle.to_string(), dir.to_path_buf()))
-        }
-    }
+struct Args {
+    handle: String,
+    outbox: PathBuf,
+    action: Action,
 }
 
 fn state_dir() -> Result<PathBuf> {
@@ -74,60 +40,168 @@ fn state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/claude-md-stream"))
 }
 
-/// Appends the sent text to the outbox log. A viewer tails that log to show the
-/// prompt when it left, rather than when the agent finally reads it. Failing to
-/// record is not worth failing a delivered message over.
-fn record(dir: &Path, text: &str) {
-    let _ = std::fs::create_dir_all(dir);
-    let entry = serde_json::json!({ "at": claude_md_stream::now_iso(), "text": text });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(claude_md_stream::sent_log(dir))
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{entry}");
-    }
+/// The agent a path belongs to is the directory it sits in. The path is
+/// resolved first: an editor passes a buffer name relative to its own working
+/// directory, which on its own has no parent to read a handle from.
+fn from_path(path: &Path) -> Result<(String, PathBuf)> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("cannot tell which agent {path:?} belongs to"))?;
+    let handle = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("cannot tell which agent {path:?} belongs to"))?;
+    Ok((handle.to_string(), dir.to_path_buf()))
 }
 
-fn run() -> Result<u8> {
-    let source = parse_args()?;
-    let (handle, dir) = target(&source)?;
+fn parse_args() -> Result<Args> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| argv.iter().any(|a| a == name);
 
-    let text = match &source {
-        Source::Named(_) => read_stdin()?,
-        Source::Buffer { stdin: true, .. } => read_stdin()?,
-        Source::Buffer { path, .. } => {
-            std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))?
+    let named = argv
+        .iter()
+        .position(|a| a == "--to")
+        .map(|i| {
+            argv.get(i + 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("--to takes an agent name"))
+        })
+        .transpose()?;
+
+    let path = argv
+        .iter()
+        .find(|a| !a.starts_with("--") && Some(*a) != named.as_ref())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("CLAUDE_SEND_TARGET").ok().map(PathBuf::from));
+
+    let (handle, outbox) = match (&named, &path) {
+        (Some(handle), _) => (handle.clone(), state_dir()?.join(handle)),
+        (None, Some(path)) => from_path(path)?,
+        (None, None) => return Err(anyhow!("{USAGE}")),
+    };
+
+    let action = if flag("--cancel") {
+        Action::Cancel
+    } else if flag("--recall") {
+        Action::Recall
+    } else if flag("--flush") {
+        Action::Flush
+    } else {
+        Action::Send {
+            stdin: flag("--stdin") || named.is_some(),
+            path,
         }
     };
 
-    if text.trim().is_empty() {
-        eprintln!("nothing to send");
-        return Ok(0);
+    Ok(Args {
+        handle,
+        outbox,
+        action,
+    })
+}
+
+/// Hands recovered text back to the caller on stdout, ahead of whatever the
+/// caller passed in, because what comes back was written before what is sitting
+/// in the buffer now. An editor pipes its buffer through this and replaces it
+/// with the result, so nothing is written to disk and nothing typed is lost.
+///
+/// The same text is also appended to `recovered.md`, because a caller that
+/// discards stdout would otherwise drop it on the floor.
+fn hand_back(outbox: &Path, texts: &[String]) -> Result<()> {
+    let mut carried = String::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::stdin().read_to_string(&mut carried)?;
     }
 
+    if !texts.is_empty() {
+        let _ = std::fs::create_dir_all(outbox);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(outbox.join("recovered.md"))
+        {
+            let _ = writeln!(file, "{}", texts.join("\n"));
+        }
+    }
+
+    let mut out = texts.join("\n");
+    if !carried.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&carried);
+    }
+    print!("{out}");
+    Ok(())
+}
+
+fn read_text(stdin: bool, path: Option<&PathBuf>) -> Result<String> {
+    if stdin {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    let path = path.ok_or_else(|| anyhow!("{USAGE}"))?;
+    std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))
+}
+
+/// Stops the turn the agent is in the middle of. The queue it keeps is not
+/// touched by this, which is why ours holds the waiting text instead.
+fn interrupt(handle: &str) -> Result<()> {
     let out = Command::new("herdr")
-        .args(["agent", "prompt", &handle, &text])
+        .args(["pane", "send-keys", handle, "esc"])
         .output()
-        .context("running `herdr agent prompt`")?;
+        .context("running `herdr pane send-keys`")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "herdr refused the interrupt: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
 
-    if out.status.success() {
-        record(&dir, &text);
-        println!("sent {} bytes to {handle}", text.len());
-        return Ok(0);
+fn run() -> Result<u8> {
+    let args = parse_args()?;
+
+    match args.action {
+        Action::Cancel => {
+            interrupt(&args.handle)?;
+            let waiting = queue::drain(&args.outbox)?;
+            eprintln!(
+                "interrupted {}, {} message(s) handed back",
+                args.handle,
+                waiting.len()
+            );
+            hand_back(&args.outbox, &waiting)?;
+        }
+        Action::Recall => {
+            let waiting: Vec<String> = queue::pop(&args.outbox)?.into_iter().collect();
+            if waiting.is_empty() {
+                eprintln!("nothing waiting to recall");
+            }
+            hand_back(&args.outbox, &waiting)?;
+        }
+        Action::Flush => match deliver_one(&args.outbox, &args.handle)? {
+            Some(sent) => println!("sent {} bytes to {}", sent.len(), args.handle),
+            None => eprintln!("nothing delivered: queue empty or {} is busy", args.handle),
+        },
+        Action::Send { stdin, path } => {
+            let text = read_text(stdin, path.as_ref())?;
+            if text.trim().is_empty() {
+                eprintln!("nothing to send");
+                return Ok(0);
+            }
+            queue::push(&args.outbox, &text)?;
+            match deliver_one(&args.outbox, &args.handle)? {
+                Some(sent) => println!("sent {} bytes to {}", sent.len(), args.handle),
+                None => println!("queued for {}, waiting for it to be free", args.handle),
+            }
+        }
     }
 
-    // The buffer is deliberately left alone: a rejected prompt is text the user
-    // still has to send somewhere.
-    let reason = String::from_utf8_lossy(&out.stderr);
-    let reason = reason.trim();
-    if reason.contains("agent_blocked") {
-        eprintln!("agent {handle} is blocked, buffer kept");
-        return Ok(3);
-    }
-    eprintln!("herdr refused the prompt: {reason}");
-    Ok(1)
+    Ok(0)
 }
 
 fn main() -> ExitCode {

@@ -43,9 +43,24 @@ hides anyway and a bare terminal shows as every other line.
 echo "what is in flake.nix" | claude-send --to <agent>
 ```
 
-Sending is one shot. The text goes to `herdr agent prompt`, which types it into
-the agent's terminal. Nothing watches a file, so there is no daemon to run and
-no buffer that has to exist.
+The queue is local. Claude Code keeps one too, but an interrupt flushes that one
+rather than discarding it, so anything handed over will be delivered. Holding
+the text here instead is what makes taking it back possible:
+
+```sh
+claude-send --to <agent> --cancel   # stop the turn, hand every waiting message back
+claude-send --to <agent> --recall   # take the last one back to edit it
+claude-send --to <agent> --flush    # hand over the next one, if the agent is free
+```
+
+`--cancel` and `--recall` print what they recovered on stdout, ahead of anything
+they were given on stdin, so an editor can pipe its buffer through and keep what
+was typed since. A copy also lands in `recovered.md`, because a caller that
+discards stdout would otherwise drop it.
+
+A message goes out as soon as the agent is free. `claude-send` delivers what it
+can when it runs, and a running `claude-md-stream tail` delivers on its poll, so
+a queue is never stuck waiting for something that has to be started by hand.
 
 An editor has a path anyway, so it can name the agent with one instead:
 
@@ -75,6 +90,8 @@ ret = [
   "delete_selection",
   ":write!",
 ]
+x = ["select_all", ":pipe claude-send --cancel '%{buffer_name}'"]
+u = ["select_all", ":pipe claude-send --recall '%{buffer_name}'"]
 ```
 
 Any editor that can pipe a buffer to a command works the same way. Nothing about

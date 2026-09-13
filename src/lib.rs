@@ -43,6 +43,21 @@ pub fn now_iso() -> String {
     )
 }
 
+/// States in which an agent takes a prompt as a prompt. In any other state the
+/// text would land in Claude Code's own input queue, which cannot be taken back:
+/// an interrupt flushes that queue rather than discarding it.
+pub fn accepts_prompt(state: Option<&str>) -> bool {
+    matches!(state, Some("idle") | Some("done"))
+}
+
+/// What herdr says an agent is doing, by the name a pane is known as.
+pub fn agent_state(handle: &str) -> Result<Option<String>> {
+    Ok(herdr_agents()?
+        .into_iter()
+        .find(|a| agent_matches(a, handle))
+        .and_then(|a| a["agent_status"].as_str().map(str::to_string)))
+}
+
 /// The outbox log `claude-send` appends to, beside the buffer it sent.
 pub fn sent_log(outbox_dir: &Path) -> PathBuf {
     outbox_dir.join("sent.jsonl")
@@ -171,6 +186,166 @@ fn first_cwd(transcript: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Text waiting to go out, one file per message, named so that the order they
+/// were written in is the order they sort in.
+///
+/// A directory rather than one file: delivery removes exactly one entry, and a
+/// rename claims it, so two processes flushing the same queue cannot send the
+/// same message twice.
+pub mod queue {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anyhow::Result;
+
+    pub fn dir(outbox: &Path) -> PathBuf {
+        outbox.join("pending")
+    }
+
+    /// Adds text to the back of the queue.
+    pub fn push(outbox: &Path, text: &str) -> Result<PathBuf> {
+        let dir = dir(outbox);
+        fs::create_dir_all(&dir)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
+        let path = dir.join(format!("{stamp:020}-{}.txt", std::process::id()));
+        fs::write(&path, text)?;
+        Ok(path)
+    }
+
+    /// Everything waiting, oldest first.
+    pub fn list(outbox: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(dir(outbox)) else {
+            return vec![];
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("txt"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Takes an entry out of the queue for delivery. `None` when another
+    /// process got there first, which is the whole point of renaming.
+    pub fn claim(path: &Path) -> Option<PathBuf> {
+        let claimed = path.with_extension("sending");
+        fs::rename(path, &claimed).ok().map(|_| claimed)
+    }
+
+    /// Puts a claimed entry back, after a delivery that did not happen.
+    pub fn release(claimed: &Path) {
+        let _ = fs::rename(claimed, claimed.with_extension("txt"));
+    }
+
+    pub fn read(path: &Path) -> Result<String> {
+        Ok(fs::read_to_string(path)?)
+    }
+
+    pub fn remove(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+
+    /// Empties the queue and returns what was in it, oldest first.
+    pub fn drain(outbox: &Path) -> Result<Vec<String>> {
+        let mut texts = Vec::new();
+        for path in list(outbox) {
+            let Some(claimed) = claim(&path) else { continue };
+            texts.push(read(&claimed)?);
+            remove(&claimed);
+        }
+        Ok(texts)
+    }
+
+    /// Takes the newest entry back out, for editing before it goes.
+    pub fn pop(outbox: &Path) -> Result<Option<String>> {
+        let Some(path) = list(outbox).pop() else {
+            return Ok(None);
+        };
+        let Some(claimed) = claim(&path) else {
+            return Ok(None);
+        };
+        let text = read(&claimed)?;
+        remove(&claimed);
+        Ok(Some(text))
+    }
+}
+
+/// Appends delivered text to the outbox log. A viewer tails that log to show a
+/// prompt when it went out. Failing to record is not worth failing a delivered
+/// message over.
+pub fn record_sent(outbox: &Path, text: &str) {
+    let _ = fs::create_dir_all(outbox);
+    let entry = serde_json::json!({ "at": now_iso(), "text": text });
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sent_log(outbox))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{entry}");
+    }
+}
+
+/// Hands the oldest waiting message to the agent, if the agent is free to take
+/// one. Exactly one: delivering puts the agent to work, and a second message
+/// would land in Claude Code's queue instead of ours.
+///
+/// `Ok(None)` means nothing moved, which covers an empty queue and a busy
+/// agent alike. Both are ordinary.
+pub fn deliver_one(outbox: &Path, handle: &str) -> Result<Option<String>> {
+    if !accepts_prompt(agent_state(handle)?.as_deref()) {
+        return Ok(None);
+    }
+    let Some(path) = queue::list(outbox).into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(claimed) = queue::claim(&path) else {
+        return Ok(None);
+    };
+    let text = queue::read(&claimed)?;
+
+    let out = Command::new("herdr")
+        .args(["agent", "prompt", handle, &text])
+        .output()
+        .context("running `herdr agent prompt`")?;
+
+    if !out.status.success() {
+        // Back in the queue: undelivered text is the user's, not ours to drop.
+        queue::release(&claimed);
+        let reason = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("herdr refused the prompt: {}", reason.trim()));
+    }
+
+    queue::remove(&claimed);
+    record_sent(outbox, &text);
+    await_pickup(handle);
+    Ok(Some(text))
+}
+
+/// Waits until herdr sees the agent working on what it was just given.
+///
+/// The state lags the keystroke by a noticeable moment, and a caller that asks
+/// again in that window is told the agent is free and hands over a second
+/// message, which then sits in Claude Code's queue rather than ours. Returning
+/// only once the work is visible closes that window. A turn that finishes
+/// inside it was genuinely that short.
+fn await_pickup(handle: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(state)) = agent_state(handle) {
+            if !accepts_prompt(Some(&state)) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// What one look at the agent list says about a followed pane. Both answers
