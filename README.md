@@ -39,14 +39,25 @@ and exits.
 ## Writing
 
 ```sh
-echo "what is in flake.nix" | claude-send --stdin ~/.local/state/claude-md-stream/<agent>/input.md
+echo "what is in flake.nix" | claude-send --to <agent>
 ```
 
-`claude-send` takes the text on stdin and reads the agent's name from the
-directory the buffer lives in. Pipe rather than point it at the file: an editor
-whose save completes asynchronously will still be writing when the reader looks.
+Sending is one shot. The text goes to `herdr agent prompt`, which types it into
+the agent's terminal. Nothing watches a file, so there is no daemon to run and
+no buffer that has to exist.
 
-Every accepted send is appended to `sent.jsonl` beside the buffer. A queued
+An editor has a path anyway, so it can name the agent with one instead:
+
+```sh
+claude-send --stdin ~/.local/state/claude-md-stream/<agent>/input.md
+```
+
+The agent's name is then the directory the buffer lives in. Pipe rather than
+point it at the file: an editor whose save completes asynchronously will still
+be writing when the reader looks.
+
+Every accepted send is appended to `sent.jsonl` under
+`~/.local/state/claude-md-stream/<agent>/`. A queued
 prompt reaches the transcript only when the turn that consumes it begins, which
 can be minutes later, so the viewer tails that log and shows what you sent the
 moment it goes out.
